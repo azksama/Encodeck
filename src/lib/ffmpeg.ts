@@ -1,0 +1,472 @@
+interface IFFmpegOptions {
+  [key: string]: string;
+}
+
+const formatOptionsMap = {
+  startTime: '-ss',
+  stopTime: '-to',
+};
+
+const videoOptionsMap = {
+  vcodec: '-c:v',
+  preset: '-preset',
+  bitrate: '-b:v',
+  minrate: '-minrate',
+  maxrate: '-maxrate',
+  bufsize: '-bufsize',
+  gopsize: '-g',
+  pixelFormat: '-pix_fmt',
+  frameRate: '-r',
+  tune: '-tune',
+  profile: '-profile:v',
+  level: '-level',
+  aspect: '-aspect',
+};
+
+const audioOptionsMap = {
+  acodec: '-c:a',
+  sampleRate: '-ar',
+};
+
+// An option is set if it has a value at all. Deliberately not a truthiness test:
+// 0 is a legitimate value (VP9 profile 0, for one) and used to be dropped here.
+function isSet(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== '';
+}
+
+// Characters that would split a path into several shell words or be read as
+// shell syntax. Plain names and URLs are left alone so the command stays tidy.
+const SHELL_UNSAFE = /[\s"'`$&|;<>()]/;
+
+// Double-quotes a file path when it needs it. Double quotes work in POSIX
+// shells, cmd.exe and PowerShell alike. A path the user already quoted is left
+// as typed.
+function quotePath(path: string): string {
+  if (!path || !SHELL_UNSAFE.test(path) || /^(".*"|'.*')$/.test(path)) {
+    return path;
+  }
+  return `"${path.replace(/(["\\$`])/g, '\\$1')}"`;
+}
+
+// eq takes a multiplier where 1 is unchanged; the sliders run in percent around
+// 0. Divided last, because 1 + -33 / 100 is 0.6699999999999999 in floating point.
+const eqFactor = (percent: number) => (percent + 100) / 100;
+
+// "Mute" in the quality list drops the audio track, the same as codec "None".
+const audioDisabled = (options: IFFmpegOptions) => options.acodec === 'none' || options.quality === 'mute';
+
+function setFlagsFromMap(map: IFFmpegOptions, options: IFFmpegOptions): string[] {
+  const flags: string[] = [];
+  // Set flags by adding provided options from the map parameter and adding the
+  // value to the flags array.
+  Object.keys(map).forEach((o) => {
+    if (isSet(options[o]) && options[o] !== 'none' && options[o] !== 'auto') {
+      const arg = [map[o], options[o]];
+      flags.push(...arg);
+    }
+  });
+  return flags;
+}
+
+// Builds an array of FFmpeg video filters (-vf).
+function setVideoFilters(options: IFFmpegOptions) {
+  const vf: string[] = [];
+
+  if (options.speed && options.speed !== 'auto') {
+    const arg = [`setpts=${options.speed}`];
+    vf.push(...arg);
+  }
+
+  // Scale Filters.
+  const scaleFilters = [];
+  if (options.size && options.size !== 'source') {
+    let arg;
+    if (options.size === 'custom' && options.fit) {
+      // Fit inside the box, keeping the source aspect ratio. Rounding to even
+      // dimensions keeps encoders like x264 from rejecting the result.
+      arg = [`scale=${options.width}:${options.height}:force_original_aspect_ratio=decrease:force_divisible_by=2`];
+    } else if (options.size === 'custom') {
+      arg = [`scale=${options.width}:${options.height}`];
+    } else {
+      // -2 keeps the aspect ratio but rounds to an even number, which x264 and
+      // x265 require: 1280x534 scaled to 1920 wide is 801 high with -1, and the
+      // encode fails. ffmpegd does the same.
+      arg = options.format === 'widescreen' ? [`scale=${options.size}:-2`] : [`scale=-2:${options.size}`];
+    }
+    scaleFilters.push(...arg);
+  }
+
+  // Only meaningful alongside a scale filter: `flags` is an option of scale, so
+  // emitting it on its own produces a filter chain ffmpeg rejects.
+  if (options.scaling && options.scaling !== 'auto' && scaleFilters.length > 0) {
+    const arg = [`flags=${options.scaling}`];
+    scaleFilters.push(...arg);
+  }
+
+  // Add Scale Filters to the vf flags
+  if (scaleFilters.length > 0) {
+    vf.push(scaleFilters.join(':'));
+  }
+
+  if (options.deband) {
+    const arg = ['deband'];
+    vf.push(...arg);
+  }
+
+  if (options.deshake) {
+    const arg = ['deshake'];
+    vf.push(...arg);
+  }
+
+  if (options.deflicker) {
+    const arg = ['deflicker'];
+    vf.push(...arg);
+  }
+
+  if (options.dejudder) {
+    const arg = ['dejudder'];
+    vf.push(...arg);
+  }
+
+  if (options.denoise !== 'none') {
+    let arg: string[] = [];
+    switch (options.denoise) {
+      case 'light':
+        arg = ['removegrain=22'];
+        break;
+      case 'medium':
+        arg = ['vaguedenoiser=threshold=3:method=soft:nsteps=5'];
+        break;
+      case 'heavy':
+        arg = ['vaguedenoiser=threshold=6:method=soft:nsteps=5'];
+        break;
+      default:
+        // A general-purpose denoiser at its own default strength. This was
+        // removegrain=0, which leaves every plane unchanged.
+        arg = ['hqdn3d'];
+        break;
+    }
+    vf.push(...arg);
+  }
+
+  if (options.deinterlace !== 'none') {
+    let arg: string[] = [];
+    switch (options.deinterlace) {
+      case 'frame':
+        arg = ['yadif=0:-1:0'];
+        break;
+      case 'field':
+        arg = ['yadif=1:-1:0'];
+        break;
+      case 'frame_nospatial':
+        arg = ['yadif=2:-1:0'];
+        break;
+      case 'field_nospatial':
+        arg = ['yadif=3:-1:0'];
+        break;
+      default:
+        break;
+    }
+    vf.push(...arg);
+  }
+
+  // EQ Filters.
+  const eq = [];
+  if (parseInt(options.contrast, 10) !== 0) {
+    const arg = [`contrast=${eqFactor(parseInt(options.contrast, 10))}`];
+    eq.push(...arg);
+  }
+
+  if (parseInt(options.brightness, 10) !== 0) {
+    const arg = [`brightness=${parseInt(options.brightness, 10) / 100}`];
+    eq.push(...arg);
+  }
+
+  if (parseInt(options.saturation, 10) !== 0) {
+    // Percent around 0 like contrast: -100 is greyscale, 200 triples, the most
+    // eq allows. It used to pass the raw 0-300 value, which eq clamps at 3.
+    const arg = [`saturation=${eqFactor(parseInt(options.saturation, 10))}`];
+    eq.push(...arg);
+  }
+
+  if (parseInt(options.gamma, 10) !== 0) {
+    const arg = [`gamma=${parseInt(options.gamma, 10) / 10}`];
+    eq.push(...arg);
+  }
+
+  if (eq.length > 0) {
+    const eqStr = eq.join(':');
+    vf.push(`eq=${eqStr}`);
+  }
+
+  return vf.join(',');
+}
+
+// Builds an array of FFmpeg audio filters (-af).
+function setAudioFilters(options: IFFmpegOptions): string {
+  const af = [];
+
+  // Checked with isSet, not truthiness: volume 0 (silence) is a real value.
+  if (isSet(options.volume) && parseInt(options.volume, 10) !== 100) {
+    const arg = [`volume=${parseInt(options.volume, 10) / 100}`];
+    af.push(...arg);
+  }
+
+  if (isSet(options.acontrast) && parseInt(options.acontrast, 10) !== 33) {
+    // acontrast takes 0-100 itself; this used to divide by 100, leaving almost
+    // no effect. 33, the filter's default, is treated as off.
+    const arg = [`acontrast=${parseInt(options.acontrast, 10)}`];
+    af.push(...arg);
+  }
+
+  // Delay every channel by the same amount, in milliseconds.
+  if (options.adelay && parseInt(options.adelay, 10) > 0) {
+    const arg = [`adelay=delays=${parseInt(options.adelay, 10)}:all=1`];
+    af.push(...arg);
+  }
+
+  return af.join(',');
+}
+
+function set2Pass(flags: string[], options: IFFmpegOptions) {
+  // Pass 1 only writes the stats log, so its output is discarded. ffmpeg cannot
+  // infer a muxer from /dev/null, so name the null muxer explicitly, and skip
+  // audio since it would be thrown away anyway. For Windows use `NUL`.
+  const op = `${flags.includes('-an') ? '' : '-an '}-f null /dev/null &&`;
+  const copy = flags.slice(); // Array clone for pass 2.
+
+  // Rewrite command with 1 and 2 pass flags and append to flags array.
+  if (options.vcodec === 'libx265' && options.codecOptions) {
+    // Add pass param if the -x265-params flag is already present.
+    const idx = flags.indexOf('-x265-params');
+    // eslint-disable-next-line no-param-reassign
+    flags[idx + 1] += ':pass=1';
+    copy[idx + 1] += ':pass=2';
+    flags.push(op);
+  } else if (options.vcodec === 'libx265') {
+    flags.push(...['-x265-params', 'pass=1', op]);
+    copy.push(...['-x265-params', 'pass=2']);
+  } else {
+    flags.push(...['-pass', '1', op]);
+    copy.push(...['-pass', '2']);
+  }
+  return copy;
+}
+
+function setFormatFlags(options: IFFmpegOptions) {
+  return setFlagsFromMap(formatOptionsMap, options);
+}
+
+function setVideoFlags(options: IFFmpegOptions) {
+  // "None" means no video track at all, so -vn replaces every other video flag.
+  // Mirrors how acodec === 'none' is handled in setAudioFlags.
+  if (options.vcodec === 'none') {
+    return ['-vn'];
+  }
+
+  const flags = setFlagsFromMap(videoOptionsMap, options);
+
+  //
+  // Set more complex options that can't be set from the videoOptionsMap.
+  //
+  // 0 is a real value: lossless for x264.
+  if (options.pass === 'crf' && isSet(options.crf)) {
+    const arg = ['-crf', options.crf];
+    flags.push(...arg);
+  }
+
+  if (options.faststart) {
+    const arg = ['-movflags', 'faststart'];
+    flags.push(...arg);
+  }
+
+  if (options.codecOptions && ['libx264', 'libx265'].includes(options.vcodec)) {
+    const arg = [`-${options.vcodec.replace('lib', '')}-params`, options.codecOptions];
+    flags.push(...arg);
+  }
+
+  return flags;
+}
+
+function setAudioFlags(options: IFFmpegOptions) {
+  // No audio track at all, so -an replaces every other audio flag.
+  if (audioDisabled(options)) {
+    return ['-an'];
+  }
+
+  const flags = setFlagsFromMap(audioOptionsMap, options);
+
+  // ffmpeg's DTS encoder is marked experimental and refuses to run without this.
+  if (options.acodec === 'dca') {
+    flags.push('-strict', '-2');
+  }
+
+  //
+  // Set more complex options that can't be set from the audioOptionsMap.
+  //
+  if (options.channel && options.channel !== 'source') {
+    const arg = ['-rematrix_maxval', '1.0', '-ac', options.channel];
+    flags.push(...arg);
+  }
+
+  if (options.quality && options.quality !== 'auto') {
+    const bitrate = options.quality === 'custom' ? options.audioBitrate : options.quality;
+    // A blank custom bitrate would emit a bare -b:a, and ffmpeg would read the
+    // output path as its argument.
+    if (isSet(bitrate)) {
+      flags.push(...['-b:a', bitrate]);
+    }
+  }
+  return flags;
+}
+
+// Filters need decoded frames, so ffmpeg refuses to filter a stream it is only
+// copying. Reports which streams have filters set while their codec is copy.
+function copyConflicts(opt: IFFmpegOptions) {
+  return {
+    video: opt.vcodec === 'copy' && setVideoFilters(opt) !== '',
+    audio: opt.acodec === 'copy' && !audioDisabled(opt) && setAudioFilters(opt) !== '',
+  };
+}
+
+// Build an array of FFmpeg from options parameter.
+function build(opt: IFFmpegOptions): string {
+  const options = opt || {};
+
+  const {
+    input,
+    output,
+    container,
+  } = options;
+
+  const flags = [
+    'ffmpeg',
+    '-i', quotePath(`${input}`),
+  ];
+
+  // Set format flags if clip options are set.
+  if (options.clip) {
+    const formatFlags = setFormatFlags(options);
+    flags.push(...formatFlags);
+  }
+
+  // Set video flags.
+  const videoFlags = setVideoFlags(options);
+  flags.push(...videoFlags);
+
+  // Set video filters. Skipped when the video track is disabled.
+  const vf = options.vcodec === 'none' ? '' : setVideoFilters(options);
+  if (vf) {
+    flags.push(`-vf "${vf}"`);
+  }
+
+  // Set audio flags.
+  const audioFlags = setAudioFlags(options);
+  flags.push(...audioFlags);
+
+  // Set audio filters. Skipped when the audio track is disabled.
+  const af = audioDisabled(options) ? '' : setAudioFilters(options);
+  if (af) {
+    flags.push(`-af "${af}"`);
+  }
+
+  // Set 2 pass output if option is set.
+  if (options.pass === '2') {
+    const copy = set2Pass(flags, options);
+    flags.push(...copy);
+  }
+
+  // Extra flags.
+  const extra = [];
+
+  if (options.extra.includes('f')) {
+    const arg = ['-f', container];
+    extra.push(...arg);
+  }
+
+  if (options.extra.includes('y')) {
+    const arg = ['-y'];
+    extra.push(...arg);
+  }
+
+  if (options.extra.includes('n')) {
+    const arg = ['-n'];
+    extra.push(...arg);
+  }
+
+  if (options.extra.includes('progress')) {
+    const arg = ['-progress pipe:1'];
+    extra.push(...arg);
+  }
+
+  if (options.extra.includes('hide_banner')) {
+    const arg = ['-hide_banner'];
+    extra.push(...arg);
+  }
+
+  if (options.extra.includes('report')) {
+    const arg = ['-report'];
+    extra.push(...arg);
+  }
+
+  if (options.loglevel !== 'none') {
+    const arg = ['-loglevel', options.loglevel];
+    extra.push(...arg);
+  }
+
+  // Set output.
+  extra.push(quotePath(output));
+
+  // Push all flags and join them as a space separated string.
+  flags.push(...extra);
+  return flags.join(' ');
+}
+
+export default {
+  build,
+  copyConflicts,
+};
+
+/** Native argv: a separate array for each pass, no shell parsing. */
+export function buildPlans(options: IFFmpegOptions): string[][] {
+  const conflicts = copyConflicts(options);
+  if (conflicts.video || conflicts.audio) throw new Error('Un flux en copie ne peut pas recevoir de filtres. Choisissez un codec.');
+  if (!options.input?.trim() || !options.output?.trim()) throw new Error('Renseignez la source et la destination.');
+  if (options.input === options.output) throw new Error('La source et la destination doivent être différentes.');
+  if (options.pass === '2' && (!options.bitrate || ['copy','none'].includes(options.vcodec))) throw new Error('Deux passes : choisissez un codec vidéo et un débit cible.');
+  if (options.extra.includes('y') && options.extra.includes('n')) throw new Error('Choisissez une seule politique d’écrasement.');
+  const make = (pass?: number) => {
+    const opts = { ...options, pass: pass ? '1' : options.pass };
+    const args: string[] = ['-i', options.input];
+    if (options.clip) args.push(...setFormatFlags(opts));
+    args.push(...(options.vcodec === 'copy' ? ['-c:v', 'copy'] : setVideoFlags(opts)));
+    const vf = options.vcodec === 'none' ? '' : setVideoFilters(opts);
+    if (vf) args.push('-vf', vf);
+    if (pass === 1) args.push('-an');
+    else {
+      args.push(...(options.acodec === 'copy' && !audioDisabled(opts) ? ['-c:a','copy'] : setAudioFlags(opts)));
+      const af = audioDisabled(opts) ? '' : setAudioFilters(opts);
+      if (af) args.push('-af', af);
+    }
+    if (pass) {
+      if (options.vcodec === 'libx265') {
+        const index = args.indexOf('-x265-params');
+        if (index >= 0) args[index+1] += `:pass=${pass}`;
+        else args.push('-x265-params', `pass=${pass}`);
+      } else args.push('-pass', String(pass));
+    }
+    for (const flag of ['y','n','hide_banner','report']) if (options.extra.includes(flag)) args.push(`-${flag}`);
+    if (options.loglevel !== 'none') args.push('-loglevel', options.loglevel);
+    if (pass === 1) args.push('-f', 'null', '-');
+    else {
+      if (options.extra.includes('f')) args.push('-f', ({mkv:'matroska',m4a:'ipod',mpg:'mpeg',ogv:'ogg'} as Record<string,string>)[options.container] || options.container);
+      args.push(options.output);
+    }
+    return args.map(String);
+  };
+  return options.pass === '2' ? [make(1),make(2)] : [make()];
+}
+export function displayPlans(plans: string[][]): string {
+  const quote = (s: string) => /^[a-zA-Z0-9_./:=,+-]+$/.test(s) ? s : `'${s.replaceAll("'", "''")}'`;
+  return plans.map(args => `ffmpeg ${args.map(quote).join(' ')}`).join('\nif ($LASTEXITCODE -eq 0) {\n') + (plans.length > 1 ? '\n}' : '');
+}
