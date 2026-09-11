@@ -34,7 +34,7 @@ export default function FormatSection({ value, onChange }: Props) {
       </Field>
 
       {value.clip ? (
-        <>
+        <div className="clip-times">
           <Field label="Start time" htmlFor="format-start">
             <Input
               id="format-start"
@@ -51,7 +51,7 @@ export default function FormatSection({ value, onChange }: Props) {
               onChange={(stopTime) => onChange({ stopTime })}
             />
           </Field>
-        </>
+        </div>
       ) : null}
     </Section>
   )

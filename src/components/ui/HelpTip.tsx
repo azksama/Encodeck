@@ -20,9 +20,10 @@ interface Choice {
 function currentChoice(id: string, values?: Record<string, string>): Choice | null {
   if (!values) return null
   const el = document.getElementById(id)
-  if (!(el instanceof HTMLSelectElement)) return null
-  const note = values[el.value]
-  return note ? { name: el.selectedOptions[0]?.text ?? el.value, note } : null
+  if (!el) return null
+  const value = el instanceof HTMLSelectElement ? el.value : el.getAttribute('data-value') || ''
+  const note = values[value]
+  return note ? { name: el.textContent || value, note } : null
 }
 
 /**
@@ -72,7 +73,7 @@ export default function HelpTip({ id, label }: HelpTipProps) {
     <span className="relative inline-flex">
       <button
         type="button"
-        aria-label={`About ${t(label)}`}
+        aria-label={`${t('About')} ${t(label)}`}
         aria-describedby={open ? tipId : undefined}
         onPointerEnter={(e) => {
           if (e.pointerType === 'mouse') show()
@@ -117,4 +118,5 @@ export default function HelpTip({ id, label }: HelpTipProps) {
     </span>
   )
 }
+
 
